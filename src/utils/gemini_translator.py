@@ -1,6 +1,8 @@
 """
 Gemini Translator - 使用 Gemini API 翻译文本为中文
 用于将 ArXiv 论文摘要翻译成简体中文
+
+修复：添加 HTTP 429 速率限制专项处理（等待 65 秒后重试）
 """
 import sys
 import time
@@ -19,24 +21,28 @@ try:
 except ImportError:
     from src.config import GEMINI_API_KEY, GEMINI_API_URL, GEMINI_MODEL, GEMINI_TIMEOUT, GEMINI_MAX_RETRIES
 
+# 每次翻译调用之间的固定间隔（秒），防止超出免费版速率限制
+_INTER_CALL_DELAY = 4
+
+
 def translate_to_chinese(text: str, max_chars: int = 100) -> str:
     """
     将英文文本翻译成简体中文。
-    
+
     Args:
         text: 要翻译的英文文本
         max_chars: 输出的最大字符数（用于 brief）
-    
+
     Returns:
         翻译后的中文文本，如果失败则返回原文
     """
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY 未配置，跳过翻译")
         return text[:max_chars] + "..." if len(text) > max_chars else text
-    
+
     if not text or len(text) < 10:
         return text
-    
+
     prompt = f"""请将以下学术论文摘要完整翻译成简体中文，要求：
 1. 保持学术风格，用词精准
 2. 完整翻译全部内容，不要省略任何信息
@@ -57,71 +63,86 @@ def translate_to_chinese(text: str, max_chars: int = 100) -> str:
         }
     }
 
-    for attempt in range(GEMINI_MAX_RETRIES):
+    max_retries = max(GEMINI_MAX_RETRIES, 4)
+
+    for attempt in range(max_retries):
         try:
+            # 每次调用前等待，防止连续请求触发速率限制
+            if attempt > 0:
+                pass  # 重试时不需要额外延迟，下面有专项等待
+            else:
+                time.sleep(_INTER_CALL_DELAY)
+
             response = httpx.post(url, json=payload, timeout=GEMINI_TIMEOUT)
+
+            # 专项处理 429 速率限制
+            if response.status_code == 429:
+                wait_time = 65  # 等待 65 秒让速率限制重置
+                logger.warning(f"Gemini API 速率限制（429），等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+
             response.raise_for_status()
-            
+
             data = response.json()
             result = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            
+
             if result:
                 return result.strip()
             else:
-                # API 返回空结果，重试
-                if attempt < GEMINI_MAX_RETRIES - 1:
-                    logger.warning(f"Gemini 返回空结果，重试 ({attempt + 1}/{GEMINI_MAX_RETRIES})...")
+                if attempt < max_retries - 1:
+                    logger.warning(f"Gemini 返回空结果，重试 ({attempt + 1}/{max_retries})...")
                     time.sleep(2 ** attempt)
                     continue
                 return text[:max_chars] + "..." if len(text) > max_chars else text
 
         except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
-            if attempt < GEMINI_MAX_RETRIES - 1:
-                logger.warning(f"Gemini 翻译失败 ({attempt + 1}/{GEMINI_MAX_RETRIES}): {e}")
+            if attempt < max_retries - 1:
+                logger.warning(f"Gemini 翻译失败 ({attempt + 1}/{max_retries}): {e}")
                 time.sleep(2 ** attempt)
                 continue
             logger.error(f"Gemini 翻译最终失败: {e}")
             return text[:max_chars] + "..." if len(text) > max_chars else text
-    
+
     return text[:max_chars] + "..." if len(text) > max_chars else text
 
 
 def translate_summary_pair(summary: str) -> tuple[str, str]:
     """
     为 ArXiv 论文生成两层摘要（中文）。
-    
+
     Args:
         summary: 英文原始摘要
-    
+
     Returns:
         (brief_cn, detail_cn) - 短摘要和详细摘要的中文版本
     """
     if not summary:
         return ("", "")
-    
+
     # Brief: 翻译前100字
     brief_cn = translate_to_chinese(summary[:200], max_chars=80)
-    
+
     # Detail: 翻译完整摘要
     detail_cn = translate_to_chinese(summary, max_chars=500)
-    
+
     return (brief_cn, detail_cn)
 
 
 def summarize_blog_article(content: str, mode: str = "brief") -> str:
     """
     为技术博客文章生成情报简报风格的中文摘要。
-    
+
     Args:
         content: 博客文章的完整内容（Markdown格式）
         mode: "brief" (一句话摘要) 或 "detail" (深度分析)
-    
+
     Returns:
         中文摘要
     """
     if not GEMINI_API_KEY or not content or len(content) < 50:
         return ""
-    
+
     if mode == "brief":
         prompt = f"""请阅读以下技术博客文章，用一句话中文概括核心观点（最多100字）。
 要求：
@@ -145,9 +166,9 @@ def summarize_blog_article(content: str, mode: str = "brief") -> str:
 文章内容：
 {content[:6000]}"""
         max_tokens = 1024
-    
+
     url = f"{GEMINI_API_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -155,20 +176,39 @@ def summarize_blog_article(content: str, mode: str = "brief") -> str:
             "maxOutputTokens": max_tokens
         }
     }
-    
-    try:
-        with httpx.Client(timeout=GEMINI_TIMEOUT) as client:
-            response = client.post(url, json=payload)
-            if response.status_code == 200:
-                data = response.json()
-                result = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                return result.strip() if result else ""
-            else:
-                logger.warning(f"Gemini 摘要失败: HTTP {response.status_code}")
-                return ""
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
-        logger.warning(f"Gemini 摘要出错: {e}")
-        return ""
+
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            time.sleep(_INTER_CALL_DELAY)
+            with httpx.Client(timeout=GEMINI_TIMEOUT) as client:
+                response = client.post(url, json=payload)
+
+                # 专项处理 429 速率限制
+                if response.status_code == 429:
+                    wait_time = 65
+                    logger.warning(f"Gemini API 速率限制（429），等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    continue
+
+                if response.status_code == 200:
+                    data = response.json()
+                    result = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    return result.strip() if result else ""
+                else:
+                    logger.warning(f"Gemini 摘要失败: HTTP {response.status_code}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return ""
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
+            logger.warning(f"Gemini 摘要出错: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return ""
+
+    return ""
 
 
 if __name__ == "__main__":
