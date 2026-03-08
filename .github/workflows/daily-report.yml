@@ -2,25 +2,27 @@ name: Daily Intelligence Report
 
 on:
   schedule:
-    - cron: '51 23 * * *'  # UTC 23:51 = 北京 07:51（避开整点高峰）
-  workflow_dispatch:
+    - cron: '51 23 * * *'  # UTC 23:51 = 北京时间 07:51（每天早晨）
+  workflow_dispatch:         # 允许手动触发（用于测试）
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout engine
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install resend
 
       - name: Generate Morning Report
         env:
@@ -32,34 +34,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python run_mission.py
 
-      - name: Deliver report to PWA
+      - name: Send Email Report
         env:
-          PWA_DEPLOY_TOKEN: ${{ secrets.PWA_DEPLOY_TOKEN }}
-        run: |
-          DATE=$(date -u +%Y-%m-%d)
-          REPORT="reports/daily_briefings/Morning_Report_${DATE}.md"
-
-          if [ ! -f "$REPORT" ]; then
-            echo "❌ Report not found: $REPORT"
-            ls -la reports/daily_briefings/ 2>/dev/null || echo "Directory does not exist"
-            exit 1
-          fi
-
-          echo "📄 Report found: $(wc -c < "$REPORT") bytes"
-
-          git clone https://x-access-token:${PWA_DEPLOY_TOKEN}@github.com/77AutumN/intel-briefing-pwa.git /tmp/pwa
-          cp "$REPORT" /tmp/pwa/data/daily_briefings/
-
-          cd /tmp/pwa
-          git config user.name "Intel Bot"
-          git config user.email "bot@7brief.com"
-          git add data/daily_briefings/
-          git diff --cached --stat
-
-          if git diff --cached --quiet; then
-            echo "✅ No changes to commit"
-          else
-            git commit -m "data: add daily report ${DATE}"
-            git push
-            echo "✅ Report delivered to intel-briefing-pwa"
-          fi
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_TO_EMAIL: ${{ secrets.RESEND_TO_EMAIL }}
+          # RESEND_FROM: ${{ secrets.RESEND_FROM }}  # 有自定义域名时取消注释
+        run: python send_email.py
