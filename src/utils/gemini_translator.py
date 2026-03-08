@@ -21,8 +21,9 @@ try:
 except ImportError:
     from src.config import GEMINI_API_KEY, GEMINI_API_URL, GEMINI_MODEL, GEMINI_TIMEOUT, GEMINI_MAX_RETRIES
 
-# 每次翻译调用之间的固定间隔（秒），防止超出免费版速率限制
-_INTER_CALL_DELAY = 4
+# 每次翻译调用之间的固定间隔（秒）
+# 15 RPM 上限 = 每4秒最多1次，设为5秒留有余量
+_INTER_CALL_DELAY = 5
 
 
 def translate_to_chinese(text: str, max_chars: int = 100) -> str:
@@ -75,9 +76,9 @@ def translate_to_chinese(text: str, max_chars: int = 100) -> str:
 
             response = httpx.post(url, json=payload, timeout=GEMINI_TIMEOUT)
 
-            # 专项处理 429 速率限制
+            # 专项处理 429 速率限制（指数退避：15/30/60秒）
             if response.status_code == 429:
-                wait_time = 65  # 等待 65 秒让速率限制重置
+                wait_time = min(15 * (2 ** attempt), 60)  # 15, 30, 60 秒
                 logger.warning(f"Gemini API 速率限制（429），等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
                 time.sleep(wait_time)
                 continue
@@ -184,9 +185,9 @@ def summarize_blog_article(content: str, mode: str = "brief") -> str:
             with httpx.Client(timeout=GEMINI_TIMEOUT) as client:
                 response = client.post(url, json=payload)
 
-                # 专项处理 429 速率限制
+                # 专项处理 429 速率限制（指数退避：15/30/60秒）
                 if response.status_code == 429:
-                    wait_time = 65
+                    wait_time = min(15 * (2 ** attempt), 60)
                     logger.warning(f"Gemini API 速率限制（429），等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
                     time.sleep(wait_time)
                     continue
